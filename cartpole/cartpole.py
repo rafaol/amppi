@@ -1,20 +1,23 @@
 # TODO:
 # - Vectorize code
+# - Does it make sense to have the cross-term of control and epsilon on cost?
+# - Fix precision matrix H
+# - Figure out if terminal cost should be added or not
 
 import gym
 import numpy as np
-import torch
-import pyro
+# import torch
+# import pyro
 
 ENV_NAME = "CartPole-v1"
 TIMESTEPS = 10  # T
-N_SAMPLES = 100  # K
+N_SAMPLES = 200  # K
 ACTION_LOW = -2.0
 ACTION_HIGH = 2.0
 
 EPSILON_LOC = 0
 EPSILON_SCALE = 10
-LAMBDA_ = 1
+LAMBDA_ = 10
 
 class CartPoleModel:
     """Refer to A. G. Barto, R. S. Sutton, and C. W. Anderson, “Neuronlike
@@ -34,9 +37,15 @@ class CartPoleModel:
         self.dt = dt #s
 
     def step(self, state, action):
-        x, x_d, theta, theta_d = state
-        # u = self.f_mag if action==1 else -self.f_mag
-        u = action*self.f_mag
+        x, x_d, theta, theta_d = np.array(state)
+        if action==1:
+            u = self.f_mag
+        elif action==0:
+            u = -self.f_mag
+        else:
+            print("Non-binary action received on CartPoleModel.step()")
+            print(action)
+            return
 
         mass = self.m_c+self.m_p #total mass
         pm = self.m_p*self.l # polemass
@@ -50,8 +59,9 @@ class CartPoleModel:
         theta_dd = theta_dd_num/theta_dd_den
 
         x_dd = factor - pm*theta_dd*np.cos(theta)/mass
+        delta = np.array([x_d, x_dd, theta_d, theta_dd])*self.dt
 
-        return state + np.array([x_d, x_dd, theta_d, theta_dd])*self.dt
+        return state+delta
 
 class AMPPI:
     """ Implements an MMPI controller as defined in Williams et al., 2017
@@ -82,12 +92,13 @@ class AMPPI:
         self.epsilon_loc = epsilon_loc
         self.epsilon_scale = epsilon_scale
         self.U = np.zeros((self.m, T))
-        self.H = np.eye(self.m)  # TODO Figure out proper value
+        self.H = np.eye(self.m)
 
 
-    def compute_cost(self, state):
-        return (10*np.square(state[0]) + 500*(np.cos(state[2]) + 1) +
-    np.square(state[1]) + 15*np.square(state[3]))
+    def compute_state_cost(self, state):
+        # Original cost function on MPPI paper
+        return (1*np.square(state[0]) + 500*np.square(np.sin(state[2]))
+                + 1*np.square(state[1]) + 1*np.square(state[3]))
 
 
     def compute_trajectory_cost(self, model, state, epsilon):
@@ -96,16 +107,18 @@ class AMPPI:
         model -- a model of the CartPole class, holds the last estimate of
         system dynamics
         state -- the trajectory initial state
-        epsilon -- a sampled noise vector for the complete trajectory
+        epsilon -- a sampled noise vector for a complete trajectory
         """
         S = 0
         for t in range(self.T):
             # Takes a step in the dynamical model and sets new state
-            state = model.step(state, self.U[:, t]+epsilon[:, t])
-            S += (self.compute_cost(state)
+            state = model.step(state, np.where(self.U[:, t]+epsilon[:, t]>0,
+                               1., 0.))  # Binarizes the noisy action
+            S += (self.compute_state_cost(state)
                   + self.lambda_*self.U[:, t].T*self.H*epsilon[:, t])
         # S += terminal_cost(state) -- lets disregard the terminal cost for now
         return S
+
 
     def sample_trajectories(self, model, state):
         if self.gaussian_noise:
@@ -114,44 +127,48 @@ class AMPPI:
                                        size=(self.K, self.m, self.T))
         else:
             epsilon = np.zeros(shape=(m, self.T))
-
         cost = np.zeros(self.K)
         eta = 0
         for k in range(self.K):
             cost[k] = self.compute_trajectory_cost(model, state, epsilon[k])
         beta = np.min(cost)
         eta = np.sum(np.exp(-1/self.lambda_*(cost-beta)))  # returns a scalar
-        omega = np.exp(-1/self.lambda_*(cost-beta)/eta)  # vector of length k
+        omega = np.exp(-1/self.lambda_*(cost-beta))/eta  # vector of length k
         return epsilon, omega, beta
+
 
     def act(self, model, state):
         epsilon, omega, beta = self.sample_trajectories(model, state)
         for t in range(self.T):
             self.U[:, t] = np.dot(omega.T, epsilon[:, :, t])
-        self.U = (self.U>=0).astype(int)  # Binarizes actions
+        self.U = np.where(self.U>0, 1.0, 0.0)  # Binarizes actions
         action = self.U[:, 0]
         self.U = np.roll(self.U, -1, axis=1)  # Shifts U_t+1 to U_t
         self.U[:, self.T-1] = np.zeros_like(self.U[:, self.T-1])
-        return action, beta
+        return action, beta, omega
 
 
 def loop():
     env = gym.make(ENV_NAME)
     state = env.reset()
-    model = CartPoleModel()
+    model = CartPoleModel(mu_p=0, mu_c=0)
     controller = AMPPI(env.observation_space, env.action_space, N_SAMPLES,
                        TIMESTEPS)
     step = 0
     while True:
         step += 1
         env.render()
-        action, cost = controller.act(model, state)
+        action, cost, omega = controller.act(model, state)
         action = int(action)  # converts from np.array to scalar
         state, _, terminal, _ = env.step(action)
-        if not step%10:
+        if not step%5:
+            print("Current state: x={0}, theta={1}".format(state[0], state[2]))
             print("Step {0}: forecast cost {1}".format(step, cost))
             print("Next actions: {}".format(controller.U))
         if terminal:
+            print("Last state: x={0}, theta={1}".format(state[0], state[2]))
+            print("Last step {0}: forecast cost {1}".format(step, cost))
+            print("Next actions: {}".format(controller.U))
             env.close()
             break
 
