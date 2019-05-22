@@ -1,11 +1,6 @@
-# TODO:
-# - Vectorize code
-
 import gym
 import numpy as np
-# import torch
-# import pyro
-import control
+import np_control
 
 ENV_NAME = "CartPole-v1"
 TIMESTEPS = 20  # T
@@ -68,11 +63,11 @@ if __name__ == "__main__":
     state = env.reset()
     state = np.array(state).reshape(-1, 1)  # Reshape to a Numpy row vector
     model = CartPoleModel(mu_p=0, mu_c=0)
-    controller = control.AMPPI(obs_space=env.observation_space,
-                               act_space=env.action_space,
-                               K=N_SAMPLES,
-                               T=TIMESTEPS,
-                               lambda_=LAMBDA_)
+    controller = np_control.MPPI(obs_space=env.observation_space,
+                                act_space=env.action_space,
+                                K=N_SAMPLES,
+                                T=TIMESTEPS,
+                                lambda_=LAMBDA_)
     step = 0
     while True:
         env.render()

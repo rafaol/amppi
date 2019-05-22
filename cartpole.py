@@ -7,15 +7,15 @@ import pyro
 import pyro.distributions as dist
 import gym
 from torch.distributions import constraints
-# Local package
 import amppi
 
 ENV_NAME = "CartPole-v1"
 TIMESTEPS = 20  # T
-N_SAMPLES = 200  # K
+N_SAMPLES = 1000  # K
 ACTION_LOW = -2.0
 ACTION_HIGH = 2.0
 LAMBDA_ = 1
+EPS_SCALE = 2
 
 class CartPoleModel:
     """Refer to A. G. Barto, R. S. Sutton, and C. W. Anderson, “Neuronlike
@@ -40,61 +40,68 @@ class CartPoleModel:
         self.f_mag = f_mag # u = f_mag N applied to the cart's center of mass
         self.dt = dt #s
 
-    def sample_params(self):
-        m = pyro.sample("m_sample", dist.Normal(self.m_c_loc, self.m_c_scale))
-        l = pyro.sample("l_sample", dist.Normal(self.l_loc, self.l_scale))
-        return torch.tensor([m, l])
+    def sample_params(self, sample_shape=[1]):
+        m = pyro.sample("m_sample", dist.Normal(self.m_c_loc, self.m_c_scale),
+                        sample_shape=sample_shape).view(-1, 1).detach()
+        l = pyro.sample("l_sample", dist.Normal(self.l_loc, self.l_scale),
+                        sample_shape=sample_shape).view(-1, 1).detach()
+        return torch.cat((m, l), dim=1)
 
-    def step(self, state, action, params):
-        x, x_d, theta, theta_d = state
-        m_c, l = params
-        u = action*self.f_mag
+    def step(self, states, actions, params):
+        """Returns the next state for a set of trajectories.
+        :param states: a tensor of the inital state stacked into a shape K x n
+        :param actions: a tensor of control actions of shape K x m
+        :param params: the sampled model parameters for these trajectories
+        """
+        x, x_d, theta, theta_d = states.chunk(4, dim=1)
+        m_c, l = params.chunk(2, dim=1)
+        u = actions*self.f_mag
 
         mass = m_c+self.m_p #total mass
         pm = self.m_p*l # polemass
-        cart_friction = self.mu_c*torch.sign(x_d)
+        cart_friction = self.mu_c*x_d.sign()
         pole_friction = (self.mu_p*theta_d)/pm
-        factor = (u + pm*torch.sin(theta)*theta_d**2 - cart_friction)/mass
-        th_num = (self.g*torch.sin(theta) - torch.cos(theta)*factor
-                  - pole_friction)
-        th_den = l*(4.0/3-(self.m_p*torch.cos(theta)**2)/mass)
-        theta_dd = th_num/th_den
+        factor = (u + pm*theta.sin()*theta_d**2 - cart_friction)/mass
+        tdd_num = (self.g*theta.sin() - theta.cos()*factor -  pole_friction)
+        tdd_den = l*(4.0/3-(self.m_p*theta.cos()**2)/mass)
+        theta_dd = tdd_num/tdd_den
 
         x_dd = factor - pm*theta_dd*torch.cos(theta)/mass
-        delta = torch.tensor([x_d, x_dd, theta_d, theta_dd])*self.dt
-        return state+delta
+        delta = torch.cat((x_d, x_dd, theta_d, theta_dd), dim=1)*self.dt
+        return states+delta
 
-    def compute_terminal_cost(self, state):
-        print("terminal_cost")
-        terminal = state[0] < -2.4 \
-                   or state[0] > 2.4 \
-                   or state[2] < -12*2*math.pi/360 \
-                   or state[2] > 12*2*math.pi/360
-        return 1000000 if terminal else 0
 
-    def compute_state_cost(self, state):
+def run_amppi(steps=200, verbose=True, msg=10):
+    def terminal_cost(states):
+        terminal = (states[:, 0] < -2.4) \
+                   + (states[:, 0] > 2.4) \
+                   + (states[:, 2] < -12*2*math.pi/360) \
+                   + (states[:, 2] > 12*2*math.pi/360).clamp(0, 1)
+        return (terminal*1000000).type(torch.float)
+
+    def state_cost(states):
         # Original cost function on MPPI paper
-        print("state_cost")
-        return (state[0]**2 + 500*torch.sin(state[2])**2
-                + 1*state[1]**2 + 1*state[3]**2)
+        return (states[:, 0]**2 + 500*torch.sin(states[:, 2])**2
+                + 1*states[:, 1]**2 + 1*states[:, 3]**2)
 
-
-if __name__ == "__main__":
     env = gym.make(ENV_NAME)
-    state = env.reset()
-    state = torch.tensor(state)
+    env.reset()
+    state = torch.tensor(env.state)
     model = CartPoleModel(mu_p=0, mu_c=0)
     controller = amppi.AMPPI(obs_space=env.observation_space,
                              act_space=env.action_space,
                              K=N_SAMPLES,
                              T=TIMESTEPS,
-                             lambda_=LAMBDA_)
+                             lambda_=LAMBDA_,
+                             cov=torch.eye(1)*EPS_SCALE,
+                             term_cost_fn=terminal_cost,
+                             inst_cost_fn=state_cost)
     step = 0
-    while True:
+    while step<steps:
         env.render()
-        u, tau, cost, omega = controller.act(model, state)
-        action = 1 if u>0 else 0  # converts to a binary scalar
-        if not step%10:
+        action, cost = controller.act(model, state)
+        action = 1 if action>0 else 0  # converts to a binary scalar for Gym
+        if verbose and not step%msg:
             print("Step {0}: forecast cost {1:.2f}".format(step, cost))
             print("Current state: x={0[0]}, theta={0[2]}".format(state))
             print("Next actions 4 actions: {}".format(
@@ -102,9 +109,13 @@ if __name__ == "__main__":
         state, _, done, _ = env.step(action)
         state = torch.tensor(state)
         if done:
-            print("Last step {0}: forecast cost {1:.2f}".format(step, cost))
-            print("Last state: x={0[0]}, theta={0[2]}".format(state))
-            print("Next actions: {}".format(controller.U.flatten()))
-            env.close()
             break
         step += 1
+    print("Last step {0}: forecast cost {1:.2f}".format(step, cost))
+    print("Last state: x={0[0]}, theta={0[2]}".format(state))
+    print("Next actions: {}".format(controller.U.flatten()))
+    env.close()
+
+
+if __name__ == "__main__":
+    run_amppi(steps=500, msg=20)

@@ -1,6 +1,6 @@
 import numpy as np
 
-class AMPPI:
+class MPPI:
     """ Implements an MMPI controller as defined in Williams et al., 2017
     'Information Theoretic MPC for Model-Based Reinforcement Learning', for
     OpenAI Gym environments.

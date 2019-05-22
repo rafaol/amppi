@@ -1,3 +1,5 @@
+# TODO: Understand the impact of the control term in the cost function S
+
 import torch
 
 class AMPPI:
@@ -13,15 +15,14 @@ class AMPPI:
     :param U: control matrix of the form [u_0, ..., u_T]
     :param lambda_: controller regularization parameter (default: 1.0)
     :param u_init: initial control action
-    :param eps_scale: covariance matrix of the Gaussian noise (default: None)
+    :param cov: covariance matrix of the Gaussian noise (default: None)
 
     Note:
     The noise epsilon will be clipped according to min_u and max_u, effectively
     epsilon <= max_u-min_u
     """
-    # params = torch.tensor([1., 1.])
-    def __init__(self, obs_space, act_space, K, T, lambda_=1.0,
-                 eps_scale=None):
+    def __init__(self, obs_space, act_space, K, T, lambda_=1.0, cov=None,
+                 inst_cost_fn=None, term_cost_fn=None, ctrl_cost=False):
         self.K = K
         self.T = T
         self.lambda_ = lambda_
@@ -36,59 +37,82 @@ class AMPPI:
             self.max_u = float(act_space.high)
             self.min_u = float(act_space.low)
         self.n = obs_space.shape[0] if obs_space.shape else 1
-        if eps_scale is None:
-            eps_scale = torch.eye(self.m)
-        eps_loc = torch.empty(self.m)
+        if cov is None:
+            cov = torch.eye(self.m)
+        eps_loc = torch.zeros(self.m)
         self.eps_dist = torch.distributions.multivariate_normal \
-                             .MultivariateNormal(eps_loc, eps_scale)
-        self.eps_pre = torch.inverse(eps_scale)
-        self.U = torch.empty((self.T, self.m))
+                             .MultivariateNormal(eps_loc, cov)
+        self.pre = torch.inverse(cov)
+        self.U = torch.zeros((self.T, self.m))
+        # Consider the cross term control cost?
+        self.ctrl = 1 if ctrl_cost else 0
 
-    def get_trajectory_cost(self, model, state, tau):
-        # TODO: figure out why a floating point exception:8 is happening
-        """ Computes the total cost of a single control trajectory
-        Keyword arguments:
-        state -- the trajectory initial state
-        tau -- a sampled trajectory
-        """
-        S = 0
-        params = model.sample_params()
-        for t in range(self.T):
-            # Takes a step in the dynamical model and sets new state
-            state = model.step(state, tau[t, :], params)
-            S += model.compute_state_cost(state)
-        # For 1-d control we can vectorize the cross-term
-        # TODO: Figure out why cross-term is adding a bias to the controller
-        # S += self.lambda_*self.eps_pre*self.U.T@(tau-self.U)  # clipped epsilon
-        S += model.compute_terminal_cost(state)
-        return S
+        # At least one cost function
+        if inst_cost_fn is None and term_cost_fn is None:
+            raise ValueError("Specify at least one cost function")
 
-    def sample_trajectories(self, model, state):
-        # eps shape is K x T x m
+        def no_cost_fn(ss):
+            return torch.zeros(ss.m, 1)
+
+        if inst_cost_fn is None:
+            self._inst_cost_fn = no_cost_fn
+        else:
+            self._inst_cost_fn = inst_cost_fn
+        if term_cost_fn is None:
+            self._term_cost_fn = no_cost_fn
+        else:
+            self._term_cost_fn = term_cost_fn
+
+    def _roll(self, step):
+        self.U = torch.roll(self.U, -step, 0)  # Shifts U_t+1 to U_t
+        self.U[-step:, :] = torch.zeros_like(self.U[-step:, :])
+
+    def _discretize(self, t):
+            one = torch.tensor(1.0)
+            return torch.where(t>0, one, -one)
+
+    def _sample_trajectories(self, model, state):
+        # Sample trajectories, eps shape is K x T x m
         eps = self.eps_dist.sample(sample_shape=[self.K, self.T])
-        tau = torch.add(eps, self.U)
-        tau = torch.clamp(tau, self.min_u, self.max_u)
-        # if self.discrete:
-        #     one = torch.tensor(1)
-        #     tau = torch.where(tau>0, one, -one)  # 1 if >0, -1 otherwise
-        cost = torch.empty(self.K)
-        eta = 0
-        for k in range(self.K):
-            cost[k] = self.get_trajectory_cost(model, state, tau[k])
-        beta = torch.min(cost)
-        eta = torch.sum(torch.exp(-1/self.lambda_*(cost-beta)))  # scalar
-        omega = torch.exp(-1/self.lambda_*(cost-beta))/eta  # tensor of size k
-        return tau, omega, beta
+        actions = torch.add(eps, self.U)
+        actions = torch.clamp(actions, self.min_u, self.max_u)
+        if self.discrete:
+            actions = self._discretize(actions)
+        eps = torch.add(actions, -self.U)  # clipped epsilon
+        states = torch.zeros(self.K, self.T+1, self.n)
+        states[:, 0, :] = state.repeat(self.K, 1)
+        for t in range(self.T):
+            # TODO: When to sample params? Every T? Every K? Both?
+            params = model.sample_params(sample_shape=[self.K])
+            states[:, t+1, :] = model.step(states[:, t, :], actions[:, t, :],
+                                           params)
+        return actions, states, eps
 
     def act(self, model, state):
-        tau, omega, beta = self.sample_trajectories(model, state)
-        eps = torch.add(tau, -self.U)  # clipped epsilon
+        """Computes the next control action and the incurred cost. Updates the
+        controller next control actions U.
+        :param model: a forward model with a step(states, actions, params)
+        function to compute the next state for a set of trajectories
+        :param state: a tensor with the system initial state
+        """
+        actions, states, eps = self._sample_trajectories(model, state)
+        # Estimate trajectories cost
+        # Need to use reshape instead of view because slice is not contiguous
+        inst_costs = self._inst_cost_fn(
+            states[:, 1:, :].reshape(-1, self.n)).view(self.K, self.T)
+        term_costs = self._term_cost_fn(states[:, -1, :]).view(self.K)
+        # eps is elementwise multiplied and then summed over m, shape is K x T
+        ctrl_costs = self.lambda_*(actions@self.pre*eps).sum(dim=2)*self.ctrl
+        costs = term_costs + (inst_costs + ctrl_costs).sum(dim=1)  # shape is K
+        beta = torch.min(costs)
+        eta = torch.exp(-1/self.lambda_*(costs-beta)).sum()  # scalar
+        omega = torch.exp(-1/self.lambda_*(costs-beta))/eta  # tensor of size K
         # use torch.tensordot to multiply omega and epsilon for all T
         self.U = torch.tensordot(omega, eps, dims=1)
         # Even though tau has been clipped, epsilon can be of mag (u_max-u_min)
         # so we need to clip U again
         self.U = torch.clamp(self.U, self.min_u, self.max_u)
         action = self.U[0, :]
-        self.U = torch.roll(self.U, -1, 0)  # Shifts U_t+1 to U_t
-        self.U[self.T-1, :] = torch.empty_like(self.U[self.T-1, :])
-        return action, tau, beta, omega
+        self._roll(step=1)
+        cost = omega.dot(costs)
+        return action, cost

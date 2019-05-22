@@ -1,4 +1,4 @@
-# TODO: Vectorize code
+# TODO: Understand why results are so sensitive on the cost function
 
 import math
 import torch
@@ -6,15 +6,16 @@ import pyro
 import pyro.distributions as dist
 import gym
 from torch.distributions import constraints
-# local package
 import amppi
 
 ENV_NAME = "Pendulum-v0"
 TIMESTEPS = 20   # T
-N_SAMPLES = 200  # K
+N_SAMPLES = 500  # K
 ACTION_LOW = -2.0
 ACTION_HIGH = 2.0
 LAMBDA_ = 1
+CONTROL_COST = False
+EPS_SCALE = 5
 
 class PendulumModel:
     """For more information refer to OpenAI Gym environment at:
@@ -43,63 +44,88 @@ class PendulumModel:
         self.max_speed = max_speed  # m/s
         self.dt = dt #s
 
-    def sample_params(self):
-        m = pyro.sample("m_sample", dist.Normal(self.m_loc, self.m_scale))
-        l = pyro.sample("l_sample", dist.Normal(self.l_loc, self.l_scale))
-        return torch.tensor([m, l])
+    def sample_params(self, sample_shape=[1]):
+        # Use detach() to set require_grad=False
+        m = pyro.sample("m_sample", dist.Normal(self.m_loc, self.m_scale),
+                        sample_shape=sample_shape).view(-1, 1).detach()
+        l = pyro.sample("l_sample", dist.Normal(self.l_loc, self.l_scale),
+                        sample_shape=sample_shape).view(-1, 1).detach()
+        return torch.cat((m, l), dim=1)
 
-    def step(self, state, action, params):
-        theta, theta_d = state
-        m, l = params
+    def step(self, states, actions, params):
+        """Returns the next state for a set of trajectories.
+        :param states: a tensor of the inital state stacked into a shape K x n
+        :param actions: a tensor of control actions of shape K x m
+        :param params: a tensor with the sampled model parameters for these
+        trajectories of shape [param1, param2, ..., paramN] and length 1 or K
+        """
+        # Assigning states and params, keeping their dims
+        theta, theta_d = states.chunk(2, dim=1)
+        m, l = params.chunk(2, dim=1)
         g = self.g
         dt = self.dt
 
-        theta_d = theta_d + dt*(-3*g/(2*l) * torch.sin(theta+math.pi)
-                                + 3./(m*l**2)*action)
+        theta_d = theta_d + dt*(-3*g/(2*l)*(theta+math.pi).sin()
+                                + 3./(m*l**2)*actions)
         theta = theta + theta_d*dt  # Use new theta_d
         theta_d = torch.clamp(theta_d, -self.max_speed, self.max_speed)
-        return torch.tensor([theta, theta_d])
+        return torch.cat((theta, theta_d), dim=1)
 
-    def compute_terminal_cost(self, state):
-        return 0
 
-    def compute_state_cost(self, state):
+def run_amppi(steps=200, verbose=True, msg=10):
+    def terminal_cost(states):
+        return torch.zeros(states.shape[0])
+
+    def state_cost(states):
         # Note that theta may range beyond 2*pi
-        theta, theta_d = state
-        return (10*(torch.cos(theta)-1)**2 + .01*theta_d**2).reshape(-1, 1)
+        theta, theta_d = states.chunk(2, dim=1)
+        return (10*(theta.cos()-1)**2 + 0.1*theta_d**2)
 
-
-if __name__ == "__main__":
+    states = []
+    actions = []
+    costs = []
     env = gym.make(ENV_NAME)
     env.reset()
-    state = env.state
-    state = torch.tensor(state)
-    model = PendulumModel()
+    state = torch.tensor(env.state)
+    model = PendulumModel(g=10, l_scale=0.0, m_scale=0.0)
     controller = amppi.AMPPI(obs_space=env.observation_space,
                              act_space=env.action_space,
                              K=N_SAMPLES,
                              T=TIMESTEPS,
                              lambda_=LAMBDA_,
-                             eps_scale=torch.eye(1)*10)
+                             cov=torch.eye(1)*EPS_SCALE,
+                             term_cost_fn=terminal_cost,
+                             inst_cost_fn=state_cost,
+                             ctrl_cost=CONTROL_COST)
+    controller.n = 2  # Not using default Gym obs_space dimension
     step = 0
-    while step<200:
+    while step<steps:
         env.render()
-        action, tau, cost, omega = controller.act(model, state)
-        if not step%25:
-            print("Step {0}: forecast cost {1:.2f}".format(step, cost))
+        action, cost = controller.act(model, state)
+        if verbose and not step%msg:
+            print("Step {0}: action taken {1:.2f}, cost {2:.2f}"\
+                  .format(step, float(action), cost))
             print("Current state: "
                   "theta={0[0]}, theta_dot={0[1]}".format(state))
             print("Next actions 4 actions: {}" \
                   .format(controller.U[:4].flatten()))
-        # input("Press Enter to continue...")
         _, _, done, _ = env.step(action)
-        state = env.state
-        state = torch.tensor(state)
+        state = torch.tensor(env.state)
         if done:
-            print("Last step {0}: forecast cost {1:.2f}".format(step, cost))
-            print("Last state: "
-                  "theta={0[0]}, theta_dot={0[1]}".format(state))
-            print("Next actions: {}".format(controller.U.flatten()))
             env.close()
             break
+        states.append(state.tolist())
+        actions.append(action.item())
+        costs.append(cost.item())
         step += 1
+
+    print("Last step {0}: action taken {1:.2f}, cost {2:.2f}"\
+          .format(step, float(action), cost))
+    print("Last state: theta={0[0]}, theta_dot={0[1]}".format(state))
+    print("Next actions: {}".format(controller.U.flatten()))
+    env.close()
+    return states, actions, costs
+
+
+if __name__ == "__main__":
+    s, a, c = run_amppi(steps=300, verbose=False)

@@ -1,17 +1,6 @@
-# TODO: Vectorize code
-
 import gym
 import numpy as np
-import torch
-import pyro
-import sys, os
-sys.path.append('~/projs/amppi')
-
-# local package
-import control
-# from rl.AgentHelper import AgentHelper
-# from rl.EnvGlue import EnvGlue
-# from rl.Envs import GymEnv
+import np_control
 
 ENV_NAME = "Pendulum-v0"
 TIMESTEPS = 20   # T
@@ -19,6 +8,7 @@ N_SAMPLES = 500  # K
 ACTION_LOW = -2.0
 ACTION_HIGH = 2.0
 LAMBDA_ = 1
+EPS_SCALE = 10
 
 class PendulumModel:
     """For information refer to OpenAI Gym environment at:
@@ -51,7 +41,7 @@ class PendulumModel:
     def compute_state_cost(self, state):
         # Note that theta may range beyond 2*np.pi
         theta, theta_d = state
-        return (10*(np.cos(theta)-1)**2 + .01*theta_d**2).reshape(-1, 1)
+        return (10*(np.cos(theta)-1)**2 + .1*theta_d**2).reshape(-1, 1)
 
 
 if __name__ == "__main__":
@@ -60,12 +50,12 @@ if __name__ == "__main__":
     state = env.state
     state = np.array(state).reshape(-1, 1)  # Reshape to a Numpy row vector
     model = PendulumModel()
-    controller = control.AMPPI(obs_space=env.observation_space,
-                               act_space=env.action_space,
-                               K=N_SAMPLES,
-                               T=TIMESTEPS,
-                               lambda_=LAMBDA_,
-                               eps_scale=10)
+    controller = np_control.MPPI(obs_space=env.observation_space,
+                                 act_space=env.action_space,
+                                 K=N_SAMPLES,
+                                 T=TIMESTEPS,
+                                 lambda_=LAMBDA_,
+                                 eps_scale=EPS_SCALE)
     step = 0
     while step<200:
         env.render()
