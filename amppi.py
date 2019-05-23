@@ -6,23 +6,26 @@ class AMPPI:
     """ Implements an MMPI controller as defined in Williams et al., 2017
     'Information Theoretic MPC for Model-Based Reinforcement Learning', for
     OpenAI Gym environments.
-    :param env: an OpenAi Gym environment
     :param obs_space: an OpenAI bounding box for the state space
     :param act_space: an OpenAI bounding box for the action space, the min_u
     (max_u) minimum (maximum) control value is derived from act_space
     :param K: number of sampled trajectories
     :param T: number of timesteps in the control horizon
-    :param U: control matrix of the form [u_0, ..., u_T]
     :param lambda_: controller regularization parameter (default: 1.0)
-    :param u_init: initial control action
     :param cov: covariance matrix of the Gaussian noise (default: None)
+    :param sampling: can be set to either 'single' or 'extended', controls if
+    the forward model parameters samples are common or not to all trajectories
+    (default: 'single')
+    :param ctrl_cost: bool, if True the control actions cost is considered,
+    otherwise they are disregarded (default: False)
 
     Note:
     The noise epsilon will be clipped according to min_u and max_u, effectively
     epsilon <= max_u-min_u
     """
     def __init__(self, obs_space, act_space, K, T, lambda_=1.0, cov=None,
-                 inst_cost_fn=None, term_cost_fn=None, ctrl_cost=False):
+                 sampling='single', inst_cost_fn=None, term_cost_fn=None,
+                 ctrl_cost=False):
         self.K = K
         self.T = T
         self.lambda_ = lambda_
@@ -46,6 +49,7 @@ class AMPPI:
         self.U = torch.zeros((self.T, self.m))
         # Consider the cross term control cost?
         self.ctrl = 1 if ctrl_cost else 0
+        self.sample_shape = [1] if sampling=='single' else [K]
 
         # At least one cost function
         if inst_cost_fn is None and term_cost_fn is None:
@@ -83,7 +87,7 @@ class AMPPI:
         states[:, 0, :] = state.repeat(self.K, 1)
         for t in range(self.T):
             # TODO: When to sample params? Every T? Every K? Both?
-            params = model.sample_params(sample_shape=[self.K])
+            params = model.sample_params(self.sample_shape)
             states[:, t+1, :] = model.step(states[:, t, :], actions[:, t, :],
                                            params)
         return actions, states, eps

@@ -1,6 +1,3 @@
-# TODO:
-# - Vectorize code
-
 import math
 import torch
 import pyro
@@ -15,6 +12,7 @@ N_SAMPLES = 1000  # K
 ACTION_LOW = -2.0
 ACTION_HIGH = 2.0
 LAMBDA_ = 1
+CONTROL_COST = False
 EPS_SCALE = 2
 
 class CartPoleModel:
@@ -95,7 +93,9 @@ def run_amppi(steps=200, verbose=True, msg=10):
                              lambda_=LAMBDA_,
                              cov=torch.eye(1)*EPS_SCALE,
                              term_cost_fn=terminal_cost,
-                             inst_cost_fn=state_cost)
+                             inst_cost_fn=state_cost,
+                             sampling='extended'
+                             ctrl_cost=CONTROL_COST)
     step = 0
     while step<steps:
         env.render()

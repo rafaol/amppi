@@ -45,6 +45,12 @@ class PendulumModel:
         self.dt = dt #s
 
     def sample_params(self, sample_shape=[1]):
+        """Samples parameters for the forward model.
+        :param sample_shape: a list with the length of the parameter vector.
+        Must be either [1] for a single set of parameters per time step for all
+        trajectories, or [K] for individual set o parameters for each
+        trajectory at each time step (default: [1]).
+        """
         # Use detach() to set require_grad=False
         m = pyro.sample("m_sample", dist.Normal(self.m_loc, self.m_scale),
                         sample_shape=sample_shape).view(-1, 1).detach()
@@ -87,7 +93,7 @@ def run_amppi(steps=200, verbose=True, msg=10):
     env = gym.make(ENV_NAME)
     env.reset()
     state = torch.tensor(env.state)
-    model = PendulumModel(g=10, l_scale=0.0, m_scale=0.0)
+    model = PendulumModel(g=10)
     controller = amppi.AMPPI(obs_space=env.observation_space,
                              act_space=env.action_space,
                              K=N_SAMPLES,
@@ -96,6 +102,7 @@ def run_amppi(steps=200, verbose=True, msg=10):
                              cov=torch.eye(1)*EPS_SCALE,
                              term_cost_fn=terminal_cost,
                              inst_cost_fn=state_cost,
+                             sampling='extended'
                              ctrl_cost=CONTROL_COST)
     controller.n = 2  # Not using default Gym obs_space dimension
     step = 0
