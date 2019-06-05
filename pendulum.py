@@ -1,6 +1,7 @@
 # TODO: Understand why results are so sensitive on the cost function
 
 import math
+import matplotlib.pyplot as plt
 import torch
 import pyro
 import pyro.distributions as dist
@@ -16,6 +17,9 @@ ACTION_HIGH = 2.0
 LAMBDA_ = 1
 CONTROL_COST = False
 EPS_SCALE = 5
+LOC1 = 0.7
+LOC2 = 1.3
+SCALE = 0.1
 
 class PendulumModel:
     """For more information refer to OpenAI Gym environment at:
@@ -29,17 +33,10 @@ class PendulumModel:
     :param max_speed: maximum rotational speed in m/s (default: 8)
     :param d_t: timestep length for each update in s (default: 0.05)
     """
-    def __init__(self, g=9.8, m_loc=1.0, m_scale=0.1, l_loc=1.0, l_scale=0.1,
-                 max_torque=2., max_speed=8, dt=0.05):
+    def __init__(self, params_dist, g=9.8, max_torque=2., max_speed=8,
+                 dt=0.05):
         self.g = g  #m/s^2
-        self.m_loc = pyro.param("m_loc", torch.tensor(m_loc),
-                                constraint=constraints.positive)  # kg
-        self.m_scale = pyro.param("m_scale", torch.tensor(m_scale),
-                                  constraint=constraints.positive)  # kg
-        self.l_loc = pyro.param("l_loc", torch.tensor(m_loc),
-                                constraint=constraints.positive)  # m
-        self.l_scale = pyro.param("l_scale", torch.tensor(m_scale),
-                                  constraint=constraints.positive)  # m
+        self.params_dist = params_dist
         self.max_torque = max_torque  # N/m
         self.max_speed = max_speed  # m/s
         self.dt = dt #s
@@ -51,12 +48,7 @@ class PendulumModel:
         trajectories, or [K] for individual set o parameters for each
         trajectory at each time step (default: [1]).
         """
-        # Use detach() to set require_grad=False
-        m = pyro.sample("m_sample", dist.Normal(self.m_loc, self.m_scale),
-                        sample_shape=sample_shape).view(-1, 1).detach()
-        l = pyro.sample("l_sample", dist.Normal(self.l_loc, self.l_scale),
-                        sample_shape=sample_shape).view(-1, 1).detach()
-        return torch.cat((m, l), dim=1)
+        return self.params_dist(sample_shape)
 
     def step(self, states, actions, params):
         """Returns the next state for a set of trajectories.
@@ -78,22 +70,24 @@ class PendulumModel:
         return torch.cat((theta, theta_d), dim=1)
 
 
-def run_amppi(steps=200, verbose=True, msg=10):
+def run_amppi(model, init_state, steps=200, verbose=True, steps_per_msg=20,
+              render=False):
+    """Runs the simulation loop."""
     def terminal_cost(states):
         return torch.zeros(states.shape[0])
 
     def state_cost(states):
         # Note that theta may range beyond 2*pi
         theta, theta_d = states.chunk(2, dim=1)
-        return (10*(theta.cos()-1)**2 + 0.1*theta_d**2)
+        return 10*(theta.cos()-1)**2 + 0.2*theta_d**2
 
-    states = []
-    actions = []
-    costs = []
+    states = torch.tensor([])
+    actions = torch.tensor([])
+    costs = torch.tensor([])
     env = gym.make(ENV_NAME)
     env.reset()
-    state = torch.tensor(env.state)
-    model = PendulumModel(g=10)
+    env.env.state = init_state
+    state = init_state
     controller = amppi.AMPPI(obs_space=env.observation_space,
                              act_space=env.action_space,
                              K=N_SAMPLES,
@@ -102,12 +96,13 @@ def run_amppi(steps=200, verbose=True, msg=10):
                              cov=torch.eye(1)*EPS_SCALE,
                              term_cost_fn=terminal_cost,
                              inst_cost_fn=state_cost,
-                             sampling='extended'
+                             sampling='extended',
                              ctrl_cost=CONTROL_COST)
     controller.n = 2  # Not using default Gym obs_space dimension
     step = 0
     while step<steps:
-        env.render()
+        if render:
+            env.render()
         action, cost = controller.act(model, state)
         if verbose and not step%msg:
             print("Step {0}: action taken {1:.2f}, cost {2:.2f}"\
@@ -121,18 +116,69 @@ def run_amppi(steps=200, verbose=True, msg=10):
         if done:
             env.close()
             break
-        states.append(state.tolist())
-        actions.append(action.item())
-        costs.append(cost.item())
+        states = torch.cat((states, state.reshape(1, -1)))
+        actions = torch.cat((actions, action.reshape(1, -1)))
+        costs = torch.cat((costs, cost.reshape(-1)))
         step += 1
-
-    print("Last step {0}: action taken {1:.2f}, cost {2:.2f}"\
-          .format(step, float(action), cost))
-    print("Last state: theta={0[0]}, theta_dot={0[1]}".format(state))
-    print("Next actions: {}".format(controller.U.flatten()))
+    if verbose:
+        print("Last step {0}: action taken {1:.2f}, cost {2:.2f}"\
+              .format(step, float(action), cost))
+        print("Last state: theta={0[0]}, theta_dot={0[1]}".format(state))
+        print("Next actions: {}".format(controller.U.flatten()))
     env.close()
     return states, actions, costs
 
 
 if __name__ == "__main__":
-    s, a, c = run_amppi(steps=300, verbose=False)
+    def params_model(sample_shape):
+        """Function to sample the model paramaters."""
+        # Use detach() to set require_grad=False
+        loc1 = pyro.param("loc1", torch.tensor(LOC1),
+                          constraint=constraints.positive)
+        loc2 = pyro.param("loc2", torch.tensor(LOC2),
+                          constraint=constraints.positive)
+        scale = pyro.param("scale", torch.tensor(SCALE),
+                           constraint=constraints.positive)
+        dist1 = dist.Normal(loc1, scale)
+        dist2 = dist.Normal(loc2, scale)
+        m = (dist1.sample(sample_shape) + dist2.sample(sample_shape))/2
+        m = m.view(-1, 1).detach()
+        l = (dist1.sample(sample_shape) + dist2.sample(sample_shape))/2
+        l = l.view(-1, 1).detach()
+        return torch.cat((m, l), dim=1)
+
+    acc_costs = torch.tensor([])
+    for i in range(10):
+        init_state = torch.empty(2).uniform_(-math.pi, math.pi)
+        cost_sum = torch.tensor([])
+        for j in range(4):
+            if j == 0:
+                LOC1 = 1.
+                LOC2 = 1.
+            else:
+                LOC1 = 0.7
+                LOC2 = 1.3
+            SCALE = float(j/10)
+            print("Seed {0}: Params dist(Loc1={1}, Loc2={2}, "
+                  "Sigma={3:0.1f})".format(i, LOC1, LOC2, SCALE))
+            model = PendulumModel(g=10, params_dist=params_model)
+            s, a, c = run_amppi(model, init_state, steps=300,
+                                verbose=False, render=False)
+            cost_sum = torch.cat((cost_sum, c.sum().reshape(-1)))
+        acc_costs = torch.cat((acc_costs, cost_sum.reshape(1, -1)), dim=0)
+    # Plot results
+    width = 0.3
+    ind0 = torch.arange(0, 20., 2.)
+    ind1 = ind0 + width
+    ind2 = ind1 + width
+    ind3 = ind2 + width
+    plt.bar(ind0, acc_costs[:, 0], width, label='Perfect model')
+    plt.bar(ind1, acc_costs[:, 1], width, label='Sigma {:0.1f}'.format(0.1))
+    plt.bar(ind2, acc_costs[:, 2], width, label='Sigma {:0.1f}'.format(0.2))
+    plt.bar(ind3, acc_costs[:, 3], width, label='Sigma {:0.1f}'.format(0.3))
+    plt.ylabel('Accumulated cost')
+    x_labels = ['Seed 0', 'Seed 1', 'Seed 2', 'Seed 3', 'Seed 4',
+                'Seed 5', 'Seed 6', 'Seed 7', 'Seed 8', 'Seed 9']
+    plt.xticks((ind1+ind2)/2, x_labels)
+    plt.legend()
+    plt.show()

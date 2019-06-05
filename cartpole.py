@@ -1,8 +1,9 @@
 import math
-import torch
+import matplotlib.pyplot as plt
 import pyro
 import pyro.distributions as dist
 import gym
+import torch
 from torch.distributions import constraints
 import amppi
 
@@ -14,6 +15,9 @@ ACTION_HIGH = 2.0
 LAMBDA_ = 1
 CONTROL_COST = False
 EPS_SCALE = 2
+LOC1 = 0.7
+LOC2 = 1.3
+SCALE = 0.1
 
 class CartPoleModel:
     """Refer to A. G. Barto, R. S. Sutton, and C. W. Anderson, “Neuronlike
@@ -21,29 +25,24 @@ class CartPoleModel:
     IEEE Transactions on Systems, Man, and Cybernetics, vol. SMC-13,
     pp. 834–846, Sept./Oct. 1983.
     """
-    def __init__(self, g=9.8, m_c_loc=1.0, m_c_scale=0.1, m_p=0.1, l_loc=0.5,
-                 l_scale=0.1, mu_c=0.0005, f_mag=10.0, mu_p=0.000002, dt=0.02):
+    def __init__(self, params_dist, g=9.8, f_mag=10.0, m_p=0.1,
+                 mu_c=0.0005, mu_p=0.000002, dt=0.02):
         self.g = g #m/sˆ2
+        self.params_dist = params_dist
         self.m_p = m_p #kg
-        self.m_c_loc = pyro.param("m_c_loc", torch.tensor(m_c_loc),
-                                  constraint=constraints.positive)
-        self.m_c_scale = pyro.param("m_c_scale", torch.tensor(m_c_scale),
-                                    constraint=constraints.positive)
-        self.l_loc = pyro.param("l_loc", torch.tensor(l_loc),
-                                constraint=constraints.positive)
-        self.l_scale = pyro.param("l_scale", torch.tensor(l_scale),
-                                  constraint=constraints.positive)
         self.mu_c = mu_c
         self.mu_p = mu_p
         self.f_mag = f_mag # u = f_mag N applied to the cart's center of mass
         self.dt = dt #s
 
     def sample_params(self, sample_shape=[1]):
-        m = pyro.sample("m_sample", dist.Normal(self.m_c_loc, self.m_c_scale),
-                        sample_shape=sample_shape).view(-1, 1).detach()
-        l = pyro.sample("l_sample", dist.Normal(self.l_loc, self.l_scale),
-                        sample_shape=sample_shape).view(-1, 1).detach()
-        return torch.cat((m, l), dim=1)
+        """Samples parameters for the forward model.
+        :param sample_shape: a list with the length of the parameter vector.
+        Must be either [1] for a single set of parameters per time step for all
+        trajectories, or [K] for individual set o parameters for each
+        trajectory at each time step (default: [1]).
+        """
+        return self.params_dist(sample_shape)
 
     def step(self, states, actions, params):
         """Returns the next state for a set of trajectories.
@@ -69,7 +68,9 @@ class CartPoleModel:
         return states+delta
 
 
-def run_amppi(steps=200, verbose=True, msg=10):
+def run_amppi(model, init_state, steps=200, verbose=True, steps_per_msg=20,
+              render=False):
+    """Runs the simulation loop."""
     def terminal_cost(states):
         terminal = (states[:, 0] < -2.4) \
                    + (states[:, 0] > 2.4) \
@@ -82,10 +83,13 @@ def run_amppi(steps=200, verbose=True, msg=10):
         return (states[:, 0]**2 + 500*torch.sin(states[:, 2])**2
                 + 1*states[:, 1]**2 + 1*states[:, 3]**2)
 
+    states = torch.tensor([])
+    actions = torch.tensor([])
+    acc_reward = 0
     env = gym.make(ENV_NAME)
     env.reset()
-    state = torch.tensor(env.state)
-    model = CartPoleModel(mu_p=0, mu_c=0)
+    env.env.state = init_state
+    state = init_state
     controller = amppi.AMPPI(obs_space=env.observation_space,
                              act_space=env.action_space,
                              K=N_SAMPLES,
@@ -94,28 +98,85 @@ def run_amppi(steps=200, verbose=True, msg=10):
                              cov=torch.eye(1)*EPS_SCALE,
                              term_cost_fn=terminal_cost,
                              inst_cost_fn=state_cost,
-                             sampling='extended'
+                             sampling='extended',
                              ctrl_cost=CONTROL_COST)
     step = 0
     while step<steps:
-        env.render()
+        if render:
+            env.render()
         action, cost = controller.act(model, state)
+        actions = torch.cat((actions, action.reshape(1, -1)))
         action = 1 if action>0 else 0  # converts to a binary scalar for Gym
         if verbose and not step%msg:
             print("Step {0}: forecast cost {1:.2f}".format(step, cost))
             print("Current state: x={0[0]}, theta={0[2]}".format(state))
             print("Next actions 4 actions: {}".format(
                   controller.U[:4].flatten()))
-        state, _, done, _ = env.step(action)
+        state, reward, done, _ = env.step(action)
         state = torch.tensor(state)
+        acc_reward += reward
         if done:
             break
+        states = torch.cat((states, state.reshape(1, -1)))
         step += 1
-    print("Last step {0}: forecast cost {1:.2f}".format(step, cost))
-    print("Last state: x={0[0]}, theta={0[2]}".format(state))
-    print("Next actions: {}".format(controller.U.flatten()))
+    if verbose:
+        print("Last step {0}: forecast cost {1:.2f}".format(step, cost))
+        print("Last state: x={0[0]}, theta={0[2]}".format(state))
+        print("Next actions: {}".format(controller.U.flatten()))
     env.close()
+    return states, actions, acc_reward
 
 
 if __name__ == "__main__":
-    run_amppi(steps=500, msg=20)
+    def params_model(sample_shape):
+        """Function to sample the model paramaters."""
+        # Use detach() to set require_grad=False
+        loc1 = pyro.param("loc1", torch.tensor(LOC1),
+                          constraint=constraints.positive)
+        loc2 = pyro.param("loc2", torch.tensor(LOC2),
+                          constraint=constraints.positive)
+        scale = pyro.param("scale", torch.tensor(SCALE),
+                           constraint=constraints.positive)
+        dist1 = dist.Normal(loc1, scale)
+        dist2 = dist.Normal(loc2, scale)
+        m = (dist1.sample(sample_shape) + dist2.sample(sample_shape))/2
+        m = m.view(-1, 1).detach()
+        l = (dist1.sample(sample_shape) + dist2.sample(sample_shape))/2
+        l = l.view(-1, 1).detach()
+        return torch.cat((m, l), dim=1)
+
+    acc_rewards = torch.tensor([])
+    for i in range(10):
+        init_state = torch.empty(4).uniform_(-0.05, 0.05)
+        seed_rwd = torch.tensor([])
+        for j in range(4):
+            if j == 0:
+                LOC1 = 1.
+                LOC2 = 1.
+            else:
+                LOC1 = 0.7
+                LOC2 = 1.3
+            SCALE = float(j/10)
+            print("Seed {0}: Params dist(Loc1={1}, Loc2={2}, "
+                  "Sigma={3:0.1f})".format(i, LOC1, LOC2, SCALE))
+            model = CartPoleModel(mu_p=0, mu_c=0, params_dist=params_model)
+            s, a, r = run_amppi(model, init_state, steps=300, verbose=False,
+                                render=False)
+            seed_rwd = torch.cat((seed_rwd, torch.tensor(r).reshape(-1)))
+        acc_rewards =  torch.cat((acc_rewards, seed_rwd.reshape(1, -1)), dim=0)
+    # Plot results
+    width = 0.3
+    ind0 = torch.arange(0, 20., 2.)
+    ind1 = ind0 + width
+    ind2 = ind1 + width
+    ind3 = ind2 + width
+    plt.bar(ind0, acc_rewards[:, 0], width, label='Perfect model')
+    plt.bar(ind1, acc_rewards[:, 1], width, label='Sigma {:0.1f}'.format(0.1))
+    plt.bar(ind2, acc_rewards[:, 2], width, label='Sigma {:0.1f}'.format(0.2))
+    plt.bar(ind3, acc_rewards[:, 3], width, label='Sigma {:0.1f}'.format(0.3))
+    plt.ylabel('Accumulated reward')
+    x_labels = ['Seed 0', 'Seed 1', 'Seed 2', 'Seed 3', 'Seed 4',
+                'Seed 5', 'Seed 6', 'Seed 7', 'Seed 8', 'Seed 9']
+    plt.xticks((ind1+ind2)/2, x_labels)
+    plt.legend()
+    plt.show()

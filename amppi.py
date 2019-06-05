@@ -86,7 +86,6 @@ class AMPPI:
         states = torch.zeros(self.K, self.T+1, self.n)
         states[:, 0, :] = state.repeat(self.K, 1)
         for t in range(self.T):
-            # TODO: When to sample params? Every T? Every K? Both?
             params = model.sample_params(self.sample_shape)
             states[:, t+1, :] = model.step(states[:, t, :], actions[:, t, :],
                                            params)
