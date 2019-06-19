@@ -1,6 +1,4 @@
-# TODO: Experiment on the control cost as a regularization factor
-# TODO: Can multiple control update steps reduce noise?
-# TODO: Does cost normalisation improve trajectory averaging
+# TODO: Does cost normalisation improve trajectory averaging?
 
 import torch
 
