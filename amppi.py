@@ -1,4 +1,6 @@
-# TODO: Understand the impact of the control term in the cost function S
+# TODO: Experiment on the control cost as a regularization factor
+# TODO: Can multiple control update steps reduce noise?
+# TODO: Does cost normalisation improve trajectory averaging
 
 import torch
 
@@ -85,8 +87,8 @@ class AMPPI:
         eps = torch.add(actions, -self.U)  # clipped epsilon
         states = torch.zeros(self.K, self.T+1, self.n)
         states[:, 0, :] = state.repeat(self.K, 1)
+        params = model.sample_params(self.sample_shape)
         for t in range(self.T):
-            params = model.sample_params(self.sample_shape)
             states[:, t+1, :] = model.step(states[:, t, :], actions[:, t, :],
                                            params)
         return actions, states, eps
@@ -101,21 +103,24 @@ class AMPPI:
         actions, states, eps = self._sample_trajectories(model, state)
         # Estimate trajectories cost
         # Need to use reshape instead of view because slice is not contiguous
-        inst_costs = self._inst_cost_fn(
-            states[:, 1:, :].reshape(-1, self.n)).view(self.K, self.T)
+        inst_costs = self._inst_cost_fn(states[:, 1:, :].reshape(-1, self.n))\
+                     .view(self.K, self.T).sum(dim=1)
         term_costs = self._term_cost_fn(states[:, -1, :]).view(self.K)
-        # eps is elementwise multiplied and then summed over m, shape is K x T
-        ctrl_costs = self.lambda_*(actions@self.pre*eps).sum(dim=2)*self.ctrl
-        costs = term_costs + (inst_costs + ctrl_costs).sum(dim=1)  # shape is K
+        # To compute ctrl_costs in a single batch for all T and all K, first we
+        # compute the T x m cost matrix, result size is K x T x T. Then take 
+        # the trace of the T x T matrices, result is dim K.
+        ctrl_costs = self.lambda_*((self.U@self.pre)@eps.transpose(1, 2))\
+                     .diagonal(dim1=1, dim2=2).sum(dim=1)*self.ctrl
+        costs = term_costs + inst_costs + ctrl_costs  # shape is K
         beta = torch.min(costs)
         eta = torch.exp(-1/self.lambda_*(costs-beta)).sum()  # scalar
         omega = torch.exp(-1/self.lambda_*(costs-beta))/eta  # tensor of size K
         # use torch.tensordot to multiply omega and epsilon for all T
-        self.U = torch.tensordot(omega, eps, dims=1)
+        self.U += torch.tensordot(omega, eps, dims=1)
         # Even though tau has been clipped, epsilon can be of mag (u_max-u_min)
         # so we need to clip U again
         self.U = torch.clamp(self.U, self.min_u, self.max_u)
         action = self.U[0, :]
-        self._roll(step=1)
+        # self._roll(step=1)
         cost = omega.dot(costs)
-        return action, cost
+        return action, cost, omega

@@ -10,13 +10,13 @@ from torch.distributions import constraints
 import amppi
 
 ENV_NAME = "Pendulum-v0"
-TIMESTEPS = 20   # T
+TIMESTEPS = 20  # T
 N_SAMPLES = 500  # K
 ACTION_LOW = -2.0
 ACTION_HIGH = 2.0
 LAMBDA_ = 1
-CONTROL_COST = False
-EPS_SCALE = 5
+CONTROL_COST = True
+EPS_SCALE = 1.0
 LOC1 = 0.7
 LOC2 = 1.3
 SCALE = 0.1
@@ -41,7 +41,7 @@ class PendulumModel:
         self.max_speed = max_speed  # m/s
         self.dt = dt #s
 
-    def sample_params(self, sample_shape=[1]):
+    def sample_params(self, sample_shape):
         """Samples parameters for the forward model.
         :param sample_shape: a list with the length of the parameter vector.
         Must be either [1] for a single set of parameters per time step for all
@@ -70,17 +70,9 @@ class PendulumModel:
         return torch.cat((theta, theta_d), dim=1)
 
 
-def run_amppi(model, init_state, steps=200, verbose=True, steps_per_msg=20,
-              render=False):
+def run_amppi(init_state, model, state_cost_fn, terminal_cost_fn, steps=200,
+              verbose=True, steps_per_msg=20, render=False):
     """Runs the simulation loop."""
-    def terminal_cost(states):
-        return torch.zeros(states.shape[0])
-
-    def state_cost(states):
-        # Note that theta may range beyond 2*pi
-        theta, theta_d = states.chunk(2, dim=1)
-        return 10*(theta.cos()-1)**2 + 0.2*theta_d**2
-
     states = torch.tensor([])
     actions = torch.tensor([])
     costs = torch.tensor([])
@@ -94,39 +86,44 @@ def run_amppi(model, init_state, steps=200, verbose=True, steps_per_msg=20,
                              T=TIMESTEPS,
                              lambda_=LAMBDA_,
                              cov=torch.eye(1)*EPS_SCALE,
-                             term_cost_fn=terminal_cost,
-                             inst_cost_fn=state_cost,
+                             term_cost_fn=terminal_cost_fn,
+                             inst_cost_fn=state_cost_fn,
                              sampling='extended',
                              ctrl_cost=CONTROL_COST)
     controller.n = 2  # Not using default Gym obs_space dimension
     step = 0
+    hist = torch.zeros(6)
     while step<steps:
         if render:
             env.render()
-        action, cost = controller.act(model, state)
-        if verbose and not step%msg:
+        for _ in range(1):
+            action, forecast_cost, omega = controller.act(model, state)
+        controller._roll(step=1)
+        hist += omega.histc(bins=6, min=0.5, max=1.0)
+        if verbose and not step%steps_per_msg:
             print("Step {0}: action taken {1:.2f}, cost {2:.2f}"\
-                  .format(step, float(action), cost))
+                  .format(step, float(action), forecast_cost))
             print("Current state: "
                   "theta={0[0]}, theta_dot={0[1]}".format(state))
             print("Next actions 4 actions: {}" \
                   .format(controller.U[:4].flatten()))
-        _, _, done, _ = env.step(action)
+        _, cost, done, _ = env.step(action)
         state = torch.tensor(env.state)
+        cost = state_cost(state.view(1, -1))
         if done:
             env.close()
             break
-        states = torch.cat((states, state.reshape(1, -1)))
-        actions = torch.cat((actions, action.reshape(1, -1)))
-        costs = torch.cat((costs, cost.reshape(-1)))
+        states = torch.cat((states, state.unsqueeze(0)))
+        actions = torch.cat((actions, action.unsqueeze(0)))
+        costs = torch.cat((costs, cost.unsqueeze(0)))
         step += 1
     if verbose:
         print("Last step {0}: action taken {1:.2f}, cost {2:.2f}"\
-              .format(step, float(action), cost))
+              .format(step, float(action), forecast_cost))
         print("Last state: theta={0[0]}, theta_dot={0[1]}".format(state))
         print("Next actions: {}".format(controller.U.flatten()))
     env.close()
-    return states, actions, costs
+    return states, actions, costs, hist
 
 
 if __name__ == "__main__":
@@ -147,38 +144,68 @@ if __name__ == "__main__":
         l = l.view(-1, 1).detach()
         return torch.cat((m, l), dim=1)
 
-    acc_costs = torch.tensor([])
-    for i in range(10):
-        init_state = torch.empty(2).uniform_(-math.pi, math.pi)
-        cost_sum = torch.tensor([])
-        for j in range(4):
-            if j == 0:
-                LOC1 = 1.
-                LOC2 = 1.
-            else:
-                LOC1 = 0.7
-                LOC2 = 1.3
-            SCALE = float(j/10)
-            print("Seed {0}: Params dist(Loc1={1}, Loc2={2}, "
-                  "Sigma={3:0.1f})".format(i, LOC1, LOC2, SCALE))
+    def terminal_cost(states):
+        return torch.zeros(states.shape[0])
+
+    def state_cost(states):
+        # Note that theta may range beyond 2*pi
+        theta, theta_d = states.chunk(2, dim=1)
+        return 10*(theta.cos()-1)**2 + 0.1*theta_d**2
+
+    init_state = torch.tensor([math.pi, 0])  # Pendulum down position
+    # init_state = torch.tensor([0.0, 0])
+    iterations = 10
+    n_models = 3
+    for i in range(n_models):
+        acc_costs = torch.tensor([])
+        acc_h = torch.zeros(6)
+        if i == 0:
+            LOC1 = 1.
+            LOC2 = 1.
+            SCALE = 0.
+            plot_color = 'g'
+            plot_label = 'Ground-truth'
+        if i == 1:
+            LOC1 = 0.7
+            LOC2 = 1.3
+            SCALE = 0.2
+            plot_color = 'r'
+            plot_label = 'Centered bimodal'
+        if i == 2:
+            LOC1 = 1.0
+            LOC2 = 1.4
+            SCALE = 0.2
+            plot_color = 'b'
+            plot_label = 'Uncentered bimodal'
+        for j in range(iterations):
+            print("Step {3}, params dist(Loc1={0}, Loc2={1}, "
+                  "Sigma={2:0.1f})".format(LOC1, LOC2, SCALE, j))
             model = PendulumModel(g=10, params_dist=params_model)
-            s, a, c = run_amppi(model, init_state, steps=300,
-                                verbose=False, render=False)
-            cost_sum = torch.cat((cost_sum, c.sum().reshape(-1)))
-        acc_costs = torch.cat((acc_costs, cost_sum.reshape(1, -1)), dim=0)
-    # Plot results
-    width = 0.3
-    ind0 = torch.arange(0, 20., 2.)
-    ind1 = ind0 + width
-    ind2 = ind1 + width
-    ind3 = ind2 + width
-    plt.bar(ind0, acc_costs[:, 0], width, label='Perfect model')
-    plt.bar(ind1, acc_costs[:, 1], width, label='Sigma {:0.1f}'.format(0.1))
-    plt.bar(ind2, acc_costs[:, 2], width, label='Sigma {:0.1f}'.format(0.2))
-    plt.bar(ind3, acc_costs[:, 3], width, label='Sigma {:0.1f}'.format(0.3))
-    plt.ylabel('Accumulated cost')
-    x_labels = ['Seed 0', 'Seed 1', 'Seed 2', 'Seed 3', 'Seed 4',
-                'Seed 5', 'Seed 6', 'Seed 7', 'Seed 8', 'Seed 9']
-    plt.xticks((ind1+ind2)/2, x_labels)
+            s, a, c, h = run_amppi(init_state, model, state_cost,
+                                   terminal_cost, verbose=False, render=True)
+            acc_costs = torch.cat((acc_costs, c.reshape(1, -1)), dim=0)
+            acc_h += h
+        # Plot results
+        cost_mean = acc_costs.mean(dim=0)
+        cost_var = acc_costs.var(dim=0)
+        t_steps = torch.arange(199).tolist()
+        plt.plot(t_steps, cost_mean.tolist(), linestyle='-', color=plot_color,
+                 label=plot_label)
+    plt.ylabel('Mean cost over time for {} runs'.format(iterations))
+    plt.legend()
+    plt.show()
+    plt.plot(t_steps, cost_mean.tolist(), linestyle='-', color=plot_color,
+             label=plot_label)
+    plt.fill_between(t_steps, cost_mean-cost_var/2, cost_mean+cost_var/2,
+                     facecolor=plot_color, alpha=0.5)
+    plt.ylabel('Cost mean and variance ({0} runs, {1})'\
+               .format(iterations, plot_label))
+    plt.legend()
+    plt.show()
+    plt.plot(a.tolist(), label='Control')
+    plt.plot(s[:, 0].tolist(), label='Angle')
+    plt.plot(s[:, 1].tolist(), label='Velocity')
+    plt.ylabel('States and actions (Single run, {})'\
+               .format(plot_label))
     plt.legend()
     plt.show()
